@@ -1,4 +1,7 @@
+import numpy as np
 import polars as pl
+from scipy import stats
+import polars.selectors as cs
 import matplotlib.pyplot as plt
 from typing import List
 import seaborn as sns
@@ -94,76 +97,77 @@ def return_VIF(df:pl.DataFrame, target_col: str)-> pd.DataFrame:
 
 
 
-def handle_outliers(df: pl.DataFrame, factor: float = 1.5, remove_outliers: bool = False) -> pl.DataFrame:
+def flag_outliers(
+    df: pl.DataFrame,
+    factor: float = 1.5,
+    feature= None
+    ) -> pl.DataFrame:
     """
-    Flag potential outliers in a Polars DataFrame using the IQR method and optionally remove them.
+    Flag potential outliers in a Polars DataFrame using the IQR method and z score.
 
     Parameters:
     - df (pl.DataFrame): The input DataFrame.
     - factor (float): The multiplier for the IQR to define the outlier thresholds.
-    - remove_outliers (bool): If True, returns the DataFrame with rows containing outliers removed.
-                              If False, returns the DataFrame with an added 'is_outlier' column.
+    - feature: The desired numerical column
 
     Returns:
-    - pl.DataFrame: The processed DataFrame either with an 'is_outlier' flag column or with outlier rows removed.
+    - pl.DataFrame: The processed DataFrame either with 'Is_Zscore_Outlier' and 'Is_IQR_Outlier' flag columns.
     """
-    # Identify numeric columns (float and int types)
-    numeric_cols = [col for col, dtype in df.schema.items() if dtype in {pl.Float64, pl.Float32, pl.Int64, pl.Int32}]
 
-    # Start with a boolean mask that assumes no outliers
-    mask = pl.Series("is_outlier", [False] * df.height)
+    df_flagged= df.clone()
+    # -------------------------------
+    # Outlier Detection using IQR
+    # -------------------------------
+    q1 = df_flagged.select(pl.col(feature).quantile(0.25)).item()
+    q3 = df_flagged.select(pl.col(feature).quantile(0.75)).item()
+    iqr = q3 - q1
+    lower_bound = q1 - factor * iqr
+    upper_bound = q3 + factor * iqr
 
-    # Iterate through each numeric column to update the mask for potential outliers
-    for col in numeric_cols:
-        q1 = df.select(pl.col(col).quantile(0.25)).item()
-        q3 = df.select(pl.col(col).quantile(0.75)).item()
-        iqr = q3 - q1
-        lower_bound = q1 - factor * iqr
-        upper_bound = q3 + factor * iqr
+    df_flagged= df_flagged.with_columns(
+        pl.when(
+            (pl.col(feature)< lower_bound) | (pl.col(feature)> upper_bound)
+        )
+        .then(True)
+        .otherwise(False)
+        .alias("Is_IQR_Outlier")
+    )
+    # -------------------------------
+    # Outlier Detection using Z-score
+    # -------------------------------
+    # Compute the z-scores for the chosen feature
+    df_flagged= df_flagged.with_columns(
+        z_score= np.abs(stats.zscore(df_flagged[feature]))
+    )
+    df_flagged= df_flagged.with_columns(
+        pl.when(pl.col('z_score') >3)
+        .then(True)
+        .otherwise(False)
+        .alias("Is_Zscore_Outlier")
+    )
 
-        # Generate a boolean mask for the current column's outliers
-        current_mask = df.select((pl.col(col) < lower_bound) | (pl.col(col) > upper_bound)).to_series()
+    # Scatter plot of z-scores to visualize anomaly detection
+    plt.figure(figsize=(8, 6))
+    # create index column
+    df_flagged= df_flagged.with_row_index()
+    plt.scatter(df_flagged["index"], df_flagged['z_score'], c=df_flagged['Is_Zscore_Outlier'], cmap="coolwarm", alpha=0.6)
+    plt.axhline(3, color='red', linestyle='--', label='Z-score Threshold (3)')
+    plt.title(f"Scatter Plot of Z-scores for {feature}")
+    plt.xlabel("Index")
+    plt.ylabel("Z-score")
+    plt.legend()
+    plt.show()
 
-        # Combine with the existing mask (row is flagged if any column is an outlier)
-        mask = mask | current_mask
-
-        if remove_outliers:
-            # Return DataFrame with outlier rows removed
-            df_clean = df.filter(~mask)
-            return df_clean
-        else:
-            # Return DataFrame with an added 'is_outlier' column for flagging
-            df_flagged = df.with_column(mask.alias("is_outlier"))
-            return df_flagged
-
-
-def remove_outliers_iqr(df: pl.DataFrame, factor: float = 1.5) -> pl.DataFrame:
-    """
-    Remove extreme outliers from numerical columns in a Polars DataFrame using the IQR method.
-
-    Parameters:
-    - df (pl.DataFrame): The input Polars DataFrame.
-    - factor (float): The multiplier for the IQR to define the outlier thresholds.
-
-    Returns:
-    - pl.DataFrame: A DataFrame with extreme outliers removed.
-    """
-    # Identify numeric columns based on schema (adjust types as needed)
-    numeric_cols = [col for col, dtype in df.schema.items() if dtype in {pl.Float64, pl.Float32, pl.Int64, pl.Int32}]
-
-    df_clean = df.clone()
-    for col in numeric_cols:
-        # Calculate Q1 and Q3 for each column
-        q1 = df_clean.select(pl.col(col).quantile(0.25)).item()
-        q3 = df_clean.select(pl.col(col).quantile(0.75)).item()
-        iqr = q3 - q1
-        lower_bound = q1 - factor * iqr
-        upper_bound = q3 + factor * iqr
-
-        # Filter rows that fall within the bounds for this column
-        df_clean = df_clean.filter((pl.col(col) >= lower_bound) & (pl.col(col) <= upper_bound))
-
-    return df_clean
+    # Summarize Outlier Counts
+    iqr_outliers = df_flagged['Is_IQR_Outlier'].sum()
+    zscore_outliers = df_flagged['Is_Zscore_Outlier'].sum()
+    print(f"Number of IQR-based outliers with factor {factor} in '{feature}': {iqr_outliers}")
+    print(f"Number of Z-score-based outliers in '{feature}': {zscore_outliers}")
+    # filter data to only include potential outliers points
+    df_flagged= df_flagged.filter(
+        (pl.col("Is_IQR_Outlier")== True) | (pl.col("Is_Zscore_Outlier")== True)
+    )[["index","Is_IQR_Outlier","Is_Zscore_Outlier"]]
+    return df_flagged
 
 
 
