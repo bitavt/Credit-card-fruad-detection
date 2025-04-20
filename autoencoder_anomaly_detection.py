@@ -6,7 +6,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import (
-classification_report,roc_auc_score, roc_curve, confusion_matrix, f1_score
+    classification_report,roc_auc_score,
+    precision_score, recall_score, confusion_matrix, f1_score
 )
 import umap
 import plotly.express as px
@@ -154,25 +155,34 @@ class AutoEncoderAnomalyDetection:
     def evaluate_model(self, threshold):
         print(f"\nEvaluating model with threshold = {threshold:.4f}...")
         print("==============================================================")
+        # make a prediction
         predictions = (self.reconstruction_errors > threshold).astype(int)
 
+        # classification report
         print("\nClassification Report:")
         print(classification_report(self.actual_labels, predictions, target_names=["Normal", "Fraud"]))
 
+        # roc auc
         roc_auc = roc_auc_score(self.actual_labels, predictions)
         print(f"ROC AUC score: {roc_auc:.4f}")
 
+        # plot confusion matrix
         cm = confusion_matrix(self.actual_labels, predictions)
         sns.heatmap(cm, linewidths=.12, cmap="coolwarm", annot=True, fmt=".1f")
         plt.title("Confusion matrix")
         plt.show()
 
+        # plot reconstruction error distribution
+        self.plot_reconstruction_error_dist(thresholds=threshold)
+
         return {
             "threshold": threshold,
             "roc_auc": roc_auc,
             "f1": f1_score(self.actual_labels, predictions),
-            "precision": np.nan_to_num(cm[1,1] / (cm[0,1] + cm[1,1])),  # TP / (FP + TP)
-            "recall": np.nan_to_num(cm[1,1] / (cm[1,0] + cm[1,1]))     # TP / (FN + TP)
+            # "precision": np.nan_to_num(cm[1,1] / (cm[0,1] + cm[1,1])),  # TP / (FP + TP)
+            # "recall": np.nan_to_num(cm[1,1] / (cm[1,0] + cm[1,1]))     # TP / (FN + TP)
+            "precision": precision_score(self.actual_labels, predictions),  # TP / (FP + TP)
+            "recall": recall_score(self.actual_labels, predictions)     # TP / (FN + TP)
         }
 
     def plot_reconstruction_error_dist(self, thresholds=None):
@@ -212,7 +222,7 @@ class AutoEncoderAnomalyDetection:
         df = pd.DataFrame(results)
 
         # Plot F1 and ROC-AUC over thresholds
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(8, 6))
         plt.plot(df["threshold"], df["f1"], label="F1 Score")
         plt.plot(df["threshold"], df["roc_auc"], label="ROC AUC")
         plt.xlabel("Threshold")
