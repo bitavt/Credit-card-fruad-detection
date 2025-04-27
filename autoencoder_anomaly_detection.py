@@ -1,16 +1,17 @@
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.metrics import (
     classification_report,roc_auc_score,
     precision_score, recall_score, confusion_matrix, f1_score
 )
+import matplotlib.pyplot as plt
+import seaborn as sns
 import umap
 import plotly.express as px
+import copy
 
 # custom imports
 from constants import *
@@ -55,89 +56,106 @@ class AutoEncoder(nn.Module):
 
 
 class AutoEncoderAnomalyDetection:
-    def __init__(self,
-                 train_loader,
-                 val_loader,
-                 test_loader,
-                 device
-                 ):
-        self.train_loader= train_loader
-        self.val_loader= val_loader
-        self.test_loader= test_loader
-        self.epoch= EPOCHS
-        self.device= device
-        # initialize auto encoder
-        self.model= AutoEncoder(
-            input_dim= len(self.train_loader.dataset[0][0])
+    def __init__(
+        self,
+        train_loader,
+        val_loader,
+        test_loader,
+        device,
+        patience: int = 3  # early stopping patience
+    ):
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+        self.device = device
+        self.patience = patience
+
+        # initialize autoencoder
+        self.model = AutoEncoder(
+            input_dim=len(self.train_loader.dataset[0][0])
         ).to(device)
-        # Initialize the optimizer
+
+        # optimizer and loss
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
-        # Initialize the loss function
         self.loss_fn = nn.MSELoss()
 
-    def training(self):
-        trainingEpoch_loss = []
-        valEpoch_loss = []
+    def training(self, max_epochs: int = EPOCHS):
+        training_epoch_loss = []
+        val_epoch_loss = []
 
-        # def train(train_loader,test_loader,optimizer,loss_fn,model,num_epochs):
-        for epoch in range(EPOCHS):
-            print(f"Epoch {epoch+1}\n-------------------------------")
-            #-------------------
-            # train
-            #-------------------
-            train_size = len(self.train_loader.dataset)
+        best_val_loss = np.inf
+        best_model_wts = copy.deepcopy(self.model.state_dict())
+        epochs_no_improve = 0
+
+        for epoch in range(max_epochs):
+            print(f"Epoch {epoch+1}\n{'-'*30}")
+            # ---------- Training --------------------------------------
             self.model.train()
-            train_batch_loss= []
-            for batch, (X,y) in enumerate(self.train_loader):
-                X, y = X.to(self.device), y.to(self.device)
-                # compute prediction and loss
-                X_reconstructed = self.model(X)
-                loss = self.loss_fn(X_reconstructed, X)
-                # Zero gradients, perform a backward pass, and update the weights
+            train_batch_losses = []
+            for batch_idx, (X, y) in enumerate(self.train_loader):
+                X = X.to(self.device)
+                # forward + backward + optimize
                 self.optimizer.zero_grad()
+                X_recon = self.model(X)
+                loss = self.loss_fn(X_recon, X)
                 loss.backward()
                 self.optimizer.step()
-                # batch loss
-                train_batch_loss.append(loss.item())
-                if batch % 1000 == 0:
-                    loss, current = loss.item(), batch * BATCH_SIZE + len(X)
-                    print(f"loss: {loss:>7f}  [{current:>5d}/{train_size:>5d}]")
-            trainingEpoch_loss.append(np.array(train_batch_loss).mean())
 
-            #-----------------
-            # validate
-            #-----------------
+                train_batch_losses.append(loss.item())
+                if batch_idx % 1000 == 0:
+                    current = batch_idx * BATCH_SIZE + len(X)
+                    print(f"  [train] loss: {loss.item():.6f}  [{current}/{len(self.train_loader.dataset)}]")
+
+            avg_train_loss = np.mean(train_batch_losses)
+            training_epoch_loss.append(avg_train_loss)
+
+            # ---------- Validation -------------------------------------
             self.model.eval()
-            # size = len(dataloader.dataset)
-            num_batches = len(self.val_loader)
-            val_loss= 0
-
+            val_batch_losses = []
             with torch.no_grad():
-                val_batch_loss= []
                 for X, y in self.val_loader:
-                    X, y = X.to(self.device), y.to(self.device)
-                    # compute prediction and loss
-                    X_reconstructed = self.model(X)
-                    loss_val = self.loss_fn(X_reconstructed, X).item()
-                    val_loss += loss_val
-                    val_batch_loss.append(loss_val)
-            valEpoch_loss.append(np.array(val_batch_loss).mean())
-            val_loss /= num_batches
-            print(f"Val Error: \n Avg loss: {val_loss:>8f} \n")
+                    X = X.to(self.device)
+                    X_recon = self.model(X)
+                    loss_val = self.loss_fn(X_recon, X).item()
+                    val_batch_losses.append(loss_val)
 
-        # plot the training process
-        plt.plot(trainingEpoch_loss, label='training loss')
-        plt.plot(valEpoch_loss, label='validation loss')
+            avg_val_loss = np.mean(val_batch_losses)
+            val_epoch_loss.append(avg_val_loss)
+            print(f"  [val]   Avg loss: {avg_val_loss:.6f}\n")
+
+            # ---------- Early Stopping Check ----------------------------
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_model_wts = copy.deepcopy(self.model.state_dict())
+                epochs_no_improve = 0
+                print(f"  Validation loss improved. Resetting patience counter.\n")
+            else:
+                epochs_no_improve += 1
+                print(f"  No improvement in validation loss for {epochs_no_improve} epoch(s).\n")
+
+            if epochs_no_improve >= self.patience:
+                print(f"Early stopping triggered! No improvement for {self.patience} epochs.")
+                print(f"Training stopped at epoch {epoch+1}.")
+                break
+
+        # load best model weights (the one with the lowest validation loss)
+        self.model.load_state_dict(best_model_wts)
+
+        # plot losses to visualize training and validation performance
+        plt.plot(training_epoch_loss, label='training loss')
+        plt.plot(val_epoch_loss, label='validation loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
         plt.legend()
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.grid()
+        plt.grid(True)
         plt.show()
 
     def form_reconstruction_error(self):
         # anomaly detection
         self.model.eval()
+        # a list containing reconstruction error on the test set
         reconstruction_errors = []
+        # a list containing the actual labels for the test set
         actual_labels = []
         with torch.no_grad():
             for X, y in self.test_loader:
@@ -153,9 +171,9 @@ class AutoEncoderAnomalyDetection:
 
 
     def evaluate_model(self, threshold):
-        print(f"\nEvaluating model with threshold = {threshold:.4f}...")
+        print(f"\nEvaluating the model on the test set with threshold = {threshold:.4f}...")
         print("==============================================================")
-        # make a prediction
+        # make a prediction (creates a list of binary values based on the threshold)
         predictions = (self.reconstruction_errors > threshold).astype(int)
 
         # classification report
@@ -173,14 +191,13 @@ class AutoEncoderAnomalyDetection:
         plt.show()
 
         # plot reconstruction error distribution
+        print("Plotting the reconstruction error distribution...")
         self.plot_reconstruction_error_dist(thresholds=threshold)
 
         return {
             "threshold": threshold,
             "roc_auc": roc_auc,
             "f1": f1_score(self.actual_labels, predictions),
-            # "precision": np.nan_to_num(cm[1,1] / (cm[0,1] + cm[1,1])),  # TP / (FP + TP)
-            # "recall": np.nan_to_num(cm[1,1] / (cm[1,0] + cm[1,1]))     # TP / (FN + TP)
             "precision": precision_score(self.actual_labels, predictions),  # TP / (FP + TP)
             "recall": recall_score(self.actual_labels, predictions)     # TP / (FN + TP)
         }
@@ -207,6 +224,7 @@ class AutoEncoderAnomalyDetection:
         plt.title("Reconstruction Error Distribution")
         plt.xlabel("Reconstruction Error")
         plt.ylabel("Density")
+        plt.yscale("log")
         plt.legend()
         plt.grid()
         plt.show()
@@ -285,39 +303,3 @@ class AutoEncoderAnomalyDetection:
 
         fig.update_layout(legend_title_text='Class')
         fig.show()
-
-    # def visualize_latent_space(self):
-    #     # Get the latent (encoded) representations
-    #     latent_reps = []
-    #     actual_labels = []
-
-    #     self.model.eval()
-    #     with torch.no_grad():
-    #         for X,y in self.test_loader:
-    #             X, y = X.to(self.device), y.to(self.device)
-    #             # find the latent representation
-    #             encoded = self.model.encoder(X)
-    #             latent_reps.append(encoded.cpu().numpy())
-    #             actual_labels.extend(y.cpu().numpy())
-
-    #     latent_reps = np.concatenate(latent_reps)
-    #     actual_labels = np.array(actual_labels)
-
-    #     reducer= umap.UMAP(n_components=2, random_state=42)
-    #     latent_umap= reducer.fit_transform(latent_reps)
-
-    #     # Plot the UMAP projection:
-    #     plt.figure(figsize=(8, 6))
-    #     # Different markers or colors for fraud vs. non-fraud
-    #     for label, marker, color in zip([0, 1], ['o', 'x'], ['blue', 'red']):
-    #         indices = np.where(actual_labels == label)
-    #         plt.scatter(latent_umap[indices, 0], latent_umap[indices, 1],
-    #                     marker=marker, color=color,
-    #                     label='Non-fraud' if label == 0 else 'Fraud', alpha=0.7, s=50)
-
-    #     plt.xlabel("UMAP Dimension 1")
-    #     plt.ylabel("UMAP Dimension 2")
-    #     plt.title("UMAP Projection of the Latent Space")
-    #     plt.legend()
-    #     plt.grid(True)
-    #     plt.show()
